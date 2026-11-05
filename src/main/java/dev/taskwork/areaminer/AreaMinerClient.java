@@ -66,10 +66,10 @@ public final class AreaMinerClient implements ClientModInitializer {
     private static final int REPATH_INTERVAL_TICKS = 40;
     /** Give up on a single block after three seconds of swinging at it. */
     private static final int MAX_TARGET_TICKS = 60;
-    private static final int STALL_TICKS = 50;
-    private static final int MAX_IDLE_TICKS = 100;
+    private static final int STALL_TICKS = 30;
+    private static final int MAX_IDLE_TICKS = 20;
     private static final int MAX_PATH_FAILURES = 3;
-    private static final int MAX_STALL_REPATHS = 3;
+    private static final int MAX_STALL_REPATHS = 2;
     private static final double LOW_OBSTACLE_HEIGHT = 0.6;
     /**
      * Blocks at or below this hardness break in a few ticks with a bare hand. Switching to a
@@ -83,6 +83,10 @@ public final class AreaMinerClient implements ClientModInitializer {
     private static final int MAX_HIT_TESTS = 24;
     /** Entries of the work list re-validated per tick (the whole list is swept in the background). */
     private static final int PRUNE_BATCH = 256;
+    /** A client-predicted break is only trusted after this many ticks without a rollback. */
+    private static final int PENDING_BREAK_TICKS = 80;
+    /** Full re-scan of the selection when the work list runs dry, to pick up lost blocks. */
+    private static final int MAX_RESCANS = 3;
 
     private static KeyBinding selectCornerKey;
     private static KeyBinding startStopKey;
@@ -98,6 +102,14 @@ public final class AreaMinerClient implements ClientModInitializer {
     private static final List<BlockPos> remaining = new ArrayList<>();
     private static final Set<BlockPos> unreachable = new HashSet<>();
     private static final Map<BlockPos, Integer> pathFailures = new HashMap<>();
+    private static final Map<BlockPos, Integer> pendingBreaks = new HashMap<>();
+    private static int rescanCount;
+    private static int areaMinX;
+    private static int areaMaxX;
+    private static int areaMinY;
+    private static int areaMaxY;
+    private static int areaMinZ;
+    private static int areaMaxZ;
     private static BlockPos target;
     private static BlockPos breaking;
     private static int targetTicks;
@@ -118,6 +130,7 @@ public final class AreaMinerClient implements ClientModInitializer {
     private static double lastWaypointDistance = Double.POSITIVE_INFINITY;
     private static int stalledTicks;
     private static int stallRepaths;
+    private static int forceJump;
     private static int idleTicks;
 
     @Override
@@ -210,6 +223,12 @@ public final class AreaMinerClient implements ClientModInitializer {
         int maxY = Math.max(cornerOne.getY(), cornerTwo.getY());
         int minZ = Math.min(cornerOne.getZ(), cornerTwo.getZ());
         int maxZ = Math.max(cornerOne.getZ(), cornerTwo.getZ());
+        areaMinX = minX;
+        areaMaxX = maxX;
+        areaMinY = minY;
+        areaMaxY = maxY;
+        areaMinZ = minZ;
+        areaMaxZ = maxZ;
         for (int x = minX; x <= maxX; x++) {
             for (int y = minY; y <= maxY; y++) {
                 for (int z = minZ; z <= maxZ; z++) {
@@ -242,6 +261,8 @@ public final class AreaMinerClient implements ClientModInitializer {
         remaining.clear();
         unreachable.clear();
         pathFailures.clear();
+        pendingBreaks.clear();
+        rescanCount = 0;
         target = null;
         breaking = null;
         targetTicks = 0;
@@ -270,8 +291,11 @@ public final class AreaMinerClient implements ClientModInitializer {
 
         // Keep the work list in sync with the world: cheap per-tick check for the current
         // target, full sweep only occasionally.
+        verifyPendingBreaks(client);
         if (target != null && !isMineable(client.world, target)) {
-            remaining.remove(target);
+            // The client predicted the break, but the server may still roll it back. Keep the
+            // block in the work list until the prediction has survived a few seconds.
+            pendingBreaks.put(target, PENDING_BREAK_TICKS);
             forgetTarget(client);
             unreachable.clear();
             pathFailures.clear();
@@ -280,7 +304,11 @@ public final class AreaMinerClient implements ClientModInitializer {
             unreachable.clear();
             pathFailures.clear();
         }
-        if (remaining.isEmpty()) {
+        if (remaining.isEmpty() && pendingBreaks.isEmpty()) {
+            if (rescanCount < MAX_RESCANS && rescanSelection(client)) {
+                rescanCount++;
+                return;
+            }
             stop(client, "区域挖掘完成");
             return;
         }
@@ -327,7 +355,6 @@ public final class AreaMinerClient implements ClientModInitializer {
             route.clear();
             route.addAll(path);
             resetWaypointProgress();
-            stallRepaths = 0;
         }
         followRoute(client);
     }
@@ -402,7 +429,7 @@ public final class AreaMinerClient implements ClientModInitializer {
         BlockPos supportBlock = player.getBlockPos().down();
 
         for (BlockPos pos : remaining) {
-            if (unreachable.contains(pos)) continue;
+            if (unreachable.contains(pos) || pendingBreaks.containsKey(pos)) continue;
             double dx = origin.x - (pos.getX() + 0.5);
             double dy = origin.y - (pos.getY() + 0.5);
             double dz = origin.z - (pos.getZ() + 0.5);
@@ -446,7 +473,7 @@ public final class AreaMinerClient implements ClientModInitializer {
         for (int i = 0; i < budget; i++) {
             if (pruneCursor >= remaining.size()) pruneCursor = 0;
             BlockPos pos = remaining.get(pruneCursor);
-            if (isMineable(client.world, pos)) {
+            if (pendingBreaks.containsKey(pos) || isMineable(client.world, pos)) {
                 pruneCursor++;
                 continue;
             }
@@ -455,6 +482,56 @@ public final class AreaMinerClient implements ClientModInitializer {
             if (pos.equals(target)) forgetTarget(client);
         }
         return changed;
+    }
+
+    /**
+     * Confirms client-predicted breaks. A block that comes back (server rollback or lag) stays
+     * in the work list and is simply mined again; a block that stays gone for a few seconds is
+     * dropped for good.
+     */
+    private static void verifyPendingBreaks(MinecraftClient client) {
+        if (pendingBreaks.isEmpty()) return;
+        var iterator = pendingBreaks.entrySet().iterator();
+        while (iterator.hasNext()) {
+            var entry = iterator.next();
+            BlockPos pos = entry.getKey();
+            if (isMineable(client.world, pos)) {
+                iterator.remove();
+                unreachable.remove(pos);
+                pathFailures.remove(pos);
+                continue;
+            }
+            int left = entry.getValue() - 1;
+            if (left <= 0) {
+                remaining.remove(pos);
+                iterator.remove();
+            } else {
+                entry.setValue(left);
+            }
+        }
+    }
+
+    /** Last-resort sweep of the original selection: re-adds anything that is still there. */
+    private static boolean rescanSelection(MinecraftClient client) {
+        Set<BlockPos> known = new HashSet<>(remaining);
+        known.addAll(pendingBreaks.keySet());
+        boolean added = false;
+        for (int x = areaMinX; x <= areaMaxX; x++) {
+            for (int y = areaMinY; y <= areaMaxY; y++) {
+                for (int z = areaMinZ; z <= areaMaxZ; z++) {
+                    BlockPos pos = new BlockPos(x, y, z);
+                    if (known.contains(pos)) continue;
+                    if (!isMineable(client.world, pos)) continue;
+                    remaining.add(pos);
+                    added = true;
+                }
+            }
+        }
+        if (added) {
+            unreachable.clear();
+            pathFailures.clear();
+        }
+        return added;
     }
 
     private static void forgetTarget(MinecraftClient client) {
@@ -466,6 +543,7 @@ public final class AreaMinerClient implements ClientModInitializer {
         route.clear();
         routeAge = 0;
         resetWaypointProgress();
+        stallRepaths = 0;
     }
 
     private static void blacklist(MinecraftClient client, BlockPos pos) {
@@ -681,9 +759,15 @@ public final class AreaMinerClient implements ClientModInitializer {
         double dx = waypoint.getX() + 0.5 - feet.x;
         double dz = waypoint.getZ() + 0.5 - feet.z;
         double dy = waypoint.getY() - feet.y;
-        if (dx * dx + dz * dz < 0.30 && Math.abs(dy) < 1.1) {
+        // Only treat the waypoint as reached when we are not still a block below it. Standing on
+        // a carpet lifts the feet by 1/16, which used to make a one-block step look "reached":
+        // the waypoint was dropped, the jump was never pressed and the miner stood against the
+        // step forever.
+        if (dx * dx + dz * dz < 0.30 && dy < 0.5) {
             route.removeFirst();
-            releaseMovement(client);
+            if (route.isEmpty()) {
+                releaseMovement(client);
+            }
             resetWaypointProgress();
             return;
         }
@@ -701,7 +785,13 @@ public final class AreaMinerClient implements ClientModInitializer {
             movementOwned = true;
         }
         client.options.forwardKey.setPressed(true);
-        client.options.jumpKey.setPressed(dy > 0.5 && client.player.isOnGround());
+        // Jump before a step, but only when it is actually close enough to matter. A stall also
+        // arms a short jump burst: most "stuck" cases are a one-block ledge the path expects us
+        // to climb.
+        boolean closeEnough = dx * dx + dz * dz < 4.0;
+        boolean wantJump = (dy > 0.5 && closeEnough) || forceJump > 0;
+        client.options.jumpKey.setPressed(wantJump && client.player.isOnGround());
+        if (forceJump > 0) forceJump--;
 
         double distance = Math.sqrt(dx * dx + dz * dz) + Math.abs(dy) * 1.5;
         if (!waypoint.equals(trackedWaypoint)) {
@@ -715,6 +805,7 @@ public final class AreaMinerClient implements ClientModInitializer {
             stalledTicks = 0;
             lastWaypointDistance = Double.POSITIVE_INFINITY;
             trackedWaypoint = null;
+            forceJump = 12;
             if (++stallRepaths > MAX_STALL_REPATHS) {
                 blacklist(client, target);
                 releaseMovement(client);
