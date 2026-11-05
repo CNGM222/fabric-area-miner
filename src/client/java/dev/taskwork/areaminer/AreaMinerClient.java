@@ -279,7 +279,7 @@ public final class AreaMinerClient implements ClientModInitializer {
         }
 
         BlockPos waypoint = route.peekFirst();
-        Vec3d feet = client.player.getPos();
+        Vec3d feet = client.player.getEntityPos();
         Vec3d destination = new Vec3d(waypoint.getX() + 0.5, waypoint.getY(), waypoint.getZ() + 0.5);
         double dx = destination.x - feet.x;
         double dy = destination.y - feet.y;
@@ -395,7 +395,7 @@ public final class AreaMinerClient implements ClientModInitializer {
 
     private static boolean canReachTarget(World world, net.minecraft.entity.player.PlayerEntity player,
                                           BlockPos feet, BlockPos target, double reach) {
-        Vec3d eye = new Vec3d(feet.getX() + 0.5, feet.getY() + player.getEyeHeight(), feet.getZ() + 0.5);
+        Vec3d eye = new Vec3d(feet.getX() + 0.5, feet.getY() + player.getEyeHeight(player.getPose()), feet.getZ() + 0.5);
         return findVisibleHit(world, player, eye, target, reach) != null;
     }
 
@@ -471,7 +471,7 @@ public final class AreaMinerClient implements ClientModInitializer {
         int maxZ = cornerTwo == null ? cornerOne.getZ() : Math.max(cornerOne.getZ(), cornerTwo.getZ());
 
         MatrixStack matrices = context.matrices();
-        Vec3d camera = MinecraftClient.getInstance().gameRenderer.getCamera().getPos();
+        Vec3d camera = MinecraftClient.getInstance().gameRenderer.getCamera().getCameraPos();
         matrices.push();
         matrices.translate(-camera.x, -camera.y, -camera.z);
         VertexConsumer lines = context.consumers().getBuffer(RenderLayers.lines());
