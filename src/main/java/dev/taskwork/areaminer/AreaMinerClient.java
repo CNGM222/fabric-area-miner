@@ -3,7 +3,10 @@ package dev.taskwork.areaminer;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderEvents;
+import net.minecraft.client.gui.DrawContext;
+import net.minecraft.client.render.RenderTickCounter;
 import net.minecraft.block.BlockState;
 import net.minecraft.client.MinecraftClient;
 import net.minecraft.client.option.KeyBinding;
@@ -108,6 +111,8 @@ public final class AreaMinerClient implements ClientModInitializer {
     private static final Map<BlockPos, Integer> pendingBreaks = new HashMap<>();
     private static int rescanCount;
     private static int ticksSinceBreak;
+    private static int totalBlocks;
+    private static int minedBlocks;
     private static Vec3d lastProgressPos = Vec3d.ZERO;
     private static int areaMinX;
     private static int areaMaxX;
@@ -156,6 +161,7 @@ public final class AreaMinerClient implements ClientModInitializer {
 
         ClientTickEvents.END_CLIENT_TICK.register(AreaMinerClient::tick);
         WorldRenderEvents.END_MAIN.register(AreaMinerClient::renderSelection);
+        HudElementRegistry.addLast(Identifier.of("areaminer", "hud"), AreaMinerClient::renderHud);
     }
 
     // ------------------------------------------------------------------ lifecycle
@@ -192,6 +198,10 @@ public final class AreaMinerClient implements ClientModInitializer {
             return;
         }
         BlockPos selected = hit.getBlockPos().toImmutable();
+        if (!setSecondNext || cornerOne == null) {
+            totalBlocks = 0;
+            minedBlocks = 0;
+        }
         if (!setSecondNext || cornerOne == null) {
             cornerOne = selected;
             cornerTwo = null;
@@ -231,6 +241,8 @@ public final class AreaMinerClient implements ClientModInitializer {
         }
 
         resetRunState();
+        totalBlocks = 0;
+        minedBlocks = 0;
         int minX = Math.min(cornerOne.getX(), cornerTwo.getX());
         int maxX = Math.max(cornerOne.getX(), cornerTwo.getX());
         int minY = Math.min(cornerOne.getY(), cornerTwo.getY());
@@ -251,6 +263,7 @@ public final class AreaMinerClient implements ClientModInitializer {
                 }
             }
         }
+        totalBlocks = remaining.size();
         if (remaining.isEmpty()) {
             client.player.sendMessage(Text.literal("选区内没有可挖掘的方块"), true);
             return;
@@ -531,6 +544,7 @@ public final class AreaMinerClient implements ClientModInitializer {
                 continue;
             }
             remaining.remove(pruneCursor);
+            minedBlocks++;
             changed = true;
             if (pos.equals(target)) forgetTarget(client);
         }
@@ -557,6 +571,7 @@ public final class AreaMinerClient implements ClientModInitializer {
             int left = entry.getValue() - 1;
             if (left <= 0) {
                 remaining.remove(pos);
+                minedBlocks++;
                 iterator.remove();
             } else {
                 entry.setValue(left);
@@ -576,6 +591,7 @@ public final class AreaMinerClient implements ClientModInitializer {
                     if (known.contains(pos)) continue;
                     if (!isMineable(client.world, pos)) continue;
                     remaining.add(pos);
+                    totalBlocks++;
                     added = true;
                 }
             }
@@ -1071,6 +1087,20 @@ public final class AreaMinerClient implements ClientModInitializer {
     }
 
     // ------------------------------------------------------------------ rendering
+
+    /** Always-visible progress readout: removed blocks / total blocks of the current run. */
+    private static void renderHud(DrawContext context, RenderTickCounter tickCounter) {
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (client.textRenderer == null || totalBlocks <= 0) return;
+        int left = Math.max(0, totalBlocks - minedBlocks);
+        String text = "区域挖掘  已拆 " + minedBlocks + " / 共 " + totalBlocks + "（剩 " + left + "）";
+        int width = client.textRenderer.getWidth(text);
+        int x = 6;
+        int y = 6;
+        context.fill(x - 3, y - 3, x + width + 3, y + 10, 0x90000000);
+        context.drawTextWithShadow(client.textRenderer, Text.literal(text), x, y,
+                left == 0 ? 0xFF55FF55 : 0xFFFFFFFF);
+    }
 
     private static void renderSelection(
             net.fabricmc.fabric.api.client.rendering.v1.world.WorldRenderContext context) {
