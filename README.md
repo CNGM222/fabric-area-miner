@@ -22,7 +22,7 @@ mod 通过 `attackBlock` / `updateBlockBreakingProgress` 使用常规方块挖�
 
 ## 构建
 
-需要 JDK 21 或更新版本、Gradle 8.13 或更新版本，并能访问 Fabric Maven 与 Mojang 下载站点：
+需要 JDK 21 或更新版本、Gradle 9.0 或更新版本，并能访问 Fabric Maven 与 Mojang 下载站点：
 
 ```powershell
 gradle build
@@ -32,7 +32,7 @@ gradle build
 
 ## Release
 
-推送 `v*` tag 会触发 GitHub Actions 构建；只有构建成功后才会创建 GitHub release 并附上 remapped mod jar。工作流使用 JDK 21 和 Gradle 8.13。
+推送 `v*` tag 会触发 GitHub Actions 构建；只有构建成功后才会创建 GitHub release 并附上 remapped mod jar。工作流使用 JDK 21 和 Gradle 9.0。
 
 ## Acknowledgements
 

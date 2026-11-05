@@ -21,7 +21,7 @@ jobs:
           java-version: '21'
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.13'
+          gradle-version: '9.0.0'
       - name: Build mod
         run: gradle build --no-daemon
       - name: Publish GitHub release
