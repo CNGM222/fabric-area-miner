@@ -104,6 +104,8 @@ public final class AreaMinerClient implements ClientModInitializer {
     private static final Map<BlockPos, Integer> pathFailures = new HashMap<>();
     private static final Map<BlockPos, Integer> pendingBreaks = new HashMap<>();
     private static int rescanCount;
+    private static int ticksSinceBreak;
+    private static Vec3d lastProgressPos = Vec3d.ZERO;
     private static int areaMinX;
     private static int areaMaxX;
     private static int areaMinY;
@@ -289,10 +291,22 @@ public final class AreaMinerClient implements ClientModInitializer {
             return;
         }
 
+        // Track "standing still": if the player neither moves nor breaks anything for three
+        // seconds, tell them what the miner is waiting for instead of silently freezing.
+        Vec3d playerPos = client.player.getEntityPos();
+        if (playerPos.squaredDistanceTo(lastProgressPos) > 0.09) {
+            lastProgressPos = playerPos;
+            ticksSinceBreak = 0;
+        } else if (++ticksSinceBreak > 60 && ticksSinceBreak % 40 == 0 && target != null) {
+            client.player.sendMessage(Text.literal("区域挖掘等待中：目标 " + format(target)
+                    + "，剩余 " + remaining.size() + " 格"), true);
+        }
+
         // Keep the work list in sync with the world: cheap per-tick check for the current
         // target, full sweep only occasionally.
         verifyPendingBreaks(client);
         if (target != null && !isMineable(client.world, target)) {
+            ticksSinceBreak = 0;
             // The client predicted the break, but the server may still roll it back. Keep the
             // block in the work list until the prediction has survived a few seconds.
             pendingBreaks.put(target, PENDING_BREAK_TICKS);
@@ -340,6 +354,7 @@ public final class AreaMinerClient implements ClientModInitializer {
                 if (failures >= MAX_PATH_FAILURES) {
                     unreachable.add(target);
                     pathFailures.remove(target);
+                    client.player.sendMessage(Text.literal("无法靠近 " + format(target) + "，已跳过"), true);
                 }
                 forgetTarget(client);
                 releaseMovement(client);
@@ -763,7 +778,7 @@ public final class AreaMinerClient implements ClientModInitializer {
         // a carpet lifts the feet by 1/16, which used to make a one-block step look "reached":
         // the waypoint was dropped, the jump was never pressed and the miner stood against the
         // step forever.
-        if (dx * dx + dz * dz < 0.30 && dy < 0.5) {
+        if (dx * dx + dz * dz < 0.30 && Math.abs(dy) < 0.5) {
             route.removeFirst();
             if (route.isEmpty()) {
                 releaseMovement(client);
@@ -807,8 +822,12 @@ public final class AreaMinerClient implements ClientModInitializer {
             trackedWaypoint = null;
             forceJump = 12;
             if (++stallRepaths > MAX_STALL_REPATHS) {
+                BlockPos stuck = target;
                 blacklist(client, target);
                 releaseMovement(client);
+                if (stuck != null) {
+                    client.player.sendMessage(Text.literal("走不到 " + format(stuck) + "，已跳过"), true);
+                }
                 return;
             }
             // Force a fresh path on the next tick.
