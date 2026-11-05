@@ -60,14 +60,11 @@ gradle build
 
 ## License / 许可证
 
-本项目采用 **[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)（署名—非商业性使用 4.0 国际）** 许可，完整条款见 [LICENSE](LICENSE)。
+本项目采用 **MIT 许可证**，完整条款见 [LICENSE](LICENSE)。
 
-允许：以任何媒介**复制、分发**本项目及其修改版本，也可以修改后再发布。
+可以自由使用、复制、修改、合并、发布、分发、再许可和/或销售本软件，只需在副本或实质性部分中保留版权声明与许可声明。
 
-条件：
-
-- **署名**：必须保留作者 **CNGM222** 与原仓库地址 <https://github.com/CNGM222/fabric-area-miner>，附上 CC BY-NC 4.0 许可证链接，并说明是否做过修改；
-- **非商业**：不得将本项目或其演绎作品用于商业目的或营利活动（例如付费分发、付费整合包、收费代练/工作室等）；如需商业授权，请通过 Issue 联系作者；
-- **不得附加限制**：不得用额外条款或技术手段限制他人行使本许可证授予的权利。
-
-> 注：带“非商业性使用”限制的许可证不属于 OSI 定义的开源许可证，本仓库按上述条款授权（source-available）。
+```
+Copyright (c) 2026 CNGM222
+https://github.com/CNGM222/fabric-area-miner
+```
