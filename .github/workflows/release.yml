@@ -3,7 +3,7 @@ name: Build and Release
 on:
   push:
     branches:
-      - main
+      - 1.21.11-fabric
     tags:
       - 'v*'
 
@@ -33,7 +33,7 @@ jobs:
             index($0, "## ") == 1 { flag = 0 }
             flag' CHANGELOG.md > RELEASE_NOTES.md
           if [ ! -s RELEASE_NOTES.md ]; then
-            echo "本版本没有单独的更新说明，详见 [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md)。" > RELEASE_NOTES.md
+            echo "本版本没有单独的更新说明，详见 [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/1.21.11-fabric/CHANGELOG.md)。" > RELEASE_NOTES.md
           fi
           echo "----- release notes -----"
           cat RELEASE_NOTES.md
