@@ -24,9 +24,22 @@ jobs:
           gradle-version: '9.0.0'
       - name: Build mod
         run: gradle build --no-daemon
+      - name: Extract release notes
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v ver="## ${version}" '
+            index($0, ver) == 1 { flag = 1; next }
+            index($0, "## ") == 1 { flag = 0 }
+            flag' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "本版本没有单独的更新说明，详见 [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/CHANGELOG.md)。" > RELEASE_NOTES.md
+          fi
+          echo "----- release notes -----"
+          cat RELEASE_NOTES.md
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
           files: build/libs/area-miner-1.1.3.jar

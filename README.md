@@ -50,6 +50,8 @@ gradle build
 
 推送 `v*` tag 会触发 GitHub Actions 构建；只有构建成功后才会创建 GitHub release 并附上 remapped mod jar。工作流使用 JDK 21 和 Gradle 9.0。
 
+**Release 说明取自 `CHANGELOG.md` 中对应版本的小节**（`## 1.1.3` 这样的标题），所以发版前先在 `CHANGELOG.md` 里写好这一版改了什么；找不到小节时会退化成一句指向 `CHANGELOG.md` 的提示。
+
 ## Acknowledgements
 
 寻路与目标选择参考了 Baritone 这类客户端自动寻路器的设计思路；渲染和输入 API 依据 Fabric 官方 API。实现没有复制 Baritone、Litematica 或 VeinMiner 的源代码。
