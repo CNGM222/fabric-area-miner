@@ -30,6 +30,8 @@ import net.minecraft.util.shape.VoxelShapes;
 import net.minecraft.world.RaycastContext;
 import net.minecraft.world.World;
 import org.lwjgl.glfw.GLFW;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -60,6 +62,7 @@ import java.util.Set;
  * </ul>
  */
 public final class AreaMinerClient implements ClientModInitializer {
+    private static final Logger LOGGER = LoggerFactory.getLogger("areaminer");
     private static final int MAX_BLOCKS = 32_768;
     private static final int MAX_PATH_NODES = 6_000;
     private static final long PATH_TIME_BUDGET_NS = 25_000_000L;
@@ -133,6 +136,15 @@ public final class AreaMinerClient implements ClientModInitializer {
     private static int stalledTicks;
     private static int stallRepaths;
     private static int forceJump;
+    private static boolean savedLeft;
+    private static boolean savedRight;
+    private static int nudgeTicks;
+    private static BlockPos nudgeDone;
+    private static final Set<BlockPos> directTried = new HashSet<>();
+    private static int directTicks;
+    private static BlockPos directTarget;
+    private static double directLastDist;
+    private static int directStallTicks;
     private static int idleTicks;
 
     @Override
@@ -264,6 +276,9 @@ public final class AreaMinerClient implements ClientModInitializer {
         unreachable.clear();
         pathFailures.clear();
         pendingBreaks.clear();
+        directTried.clear();
+        directTicks = 0;
+        directTarget = null;
         rescanCount = 0;
         target = null;
         breaking = null;
@@ -298,8 +313,14 @@ public final class AreaMinerClient implements ClientModInitializer {
             lastProgressPos = playerPos;
             ticksSinceBreak = 0;
         } else if (++ticksSinceBreak > 60 && ticksSinceBreak % 40 == 0 && target != null) {
+            double dist = Math.sqrt(client.player.getEntityPos().squaredDistanceTo(Vec3d.ofCenter(target)));
             client.player.sendMessage(Text.literal("区域挖掘等待中：目标 " + format(target)
-                    + "，剩余 " + remaining.size() + " 格"), true);
+                    + "，距 " + Math.round(dist) + " 格，路径 " + route.size()
+                    + "，剩余 " + remaining.size()), true);
+            LOGGER.info("[areaminer] waiting: target={} dist={} route={} remaining={} pos={} forward={} jump={}",
+                    target, Math.round(dist), route.size(), remaining.size(),
+                    client.player.getBlockPos(), client.options.forwardKey.isPressed(),
+                    client.options.jumpKey.isPressed());
         }
 
         // Keep the work list in sync with the world: cheap per-tick check for the current
@@ -313,6 +334,7 @@ public final class AreaMinerClient implements ClientModInitializer {
             forgetTarget(client);
             unreachable.clear();
             pathFailures.clear();
+            directTried.clear();
         }
         if (prune(client)) {
             unreachable.clear();
@@ -345,6 +367,10 @@ public final class AreaMinerClient implements ClientModInitializer {
 
         // Not visible from here: walk to a spot where it is.
         cancelBreaking(client);
+        if (directTicks > 0 && target.equals(directTarget)) {
+            directWalk(client);
+            return;
+        }
         if (route.isEmpty() || routeAge++ > REPATH_INTERVAL_TICKS) {
             List<BlockPos> path = findRoute(client, target);
             routeAge = 0;
@@ -352,8 +378,20 @@ public final class AreaMinerClient implements ClientModInitializer {
                 // A single failure can be a timeout; only give up after a few honest attempts.
                 int failures = pathFailures.merge(target, 1, Integer::sum);
                 if (failures >= MAX_PATH_FAILURES) {
-                    unreachable.add(target);
                     pathFailures.remove(target);
+                    // A* only knows 1-block steps, small drops and dry ground. If it gives up,
+                    // try what a player would do: walk straight at the block for a few seconds.
+                    if (directTicks == 0 && !directTried.contains(target)
+                            && target.getY() - client.player.getBlockY() <= 2) {
+                        directTried.add(target);
+                        directTarget = target;
+                        directTicks = 100;
+                        directStallTicks = 0;
+                        directLastDist = directDistance(client);
+                        client.player.sendMessage(Text.literal("寻路失败，尝试直接走过去：" + format(target)), true);
+                        return;
+                    }
+                    unreachable.add(target);
                     client.player.sendMessage(Text.literal("无法靠近 " + format(target) + "，已跳过"), true);
                 }
                 forgetTarget(client);
@@ -555,6 +593,8 @@ public final class AreaMinerClient implements ClientModInitializer {
         targetTicks = 0;
         idleTicks = 0;
         equippedFor = null;
+        directTicks = 0;
+        directTarget = null;
         route.clear();
         routeAge = 0;
         resetWaypointProgress();
@@ -778,7 +818,7 @@ public final class AreaMinerClient implements ClientModInitializer {
         // a carpet lifts the feet by 1/16, which used to make a one-block step look "reached":
         // the waypoint was dropped, the jump was never pressed and the miner stood against the
         // step forever.
-        if (dx * dx + dz * dz < 0.30 && Math.abs(dy) < 0.5) {
+        if (dx * dx + dz * dz < 0.16 && Math.abs(dy) < 0.5) {
             route.removeFirst();
             if (route.isEmpty()) {
                 releaseMovement(client);
@@ -797,6 +837,8 @@ public final class AreaMinerClient implements ClientModInitializer {
             savedJump = client.options.jumpKey.isPressed();
             savedSneak = client.options.sneakKey.isPressed();
             savedSprint = client.options.sprintKey.isPressed();
+            savedLeft = client.options.leftKey.isPressed();
+            savedRight = client.options.rightKey.isPressed();
             movementOwned = true;
         }
         client.options.forwardKey.setPressed(true);
@@ -807,6 +849,17 @@ public final class AreaMinerClient implements ClientModInitializer {
         boolean wantJump = (dy > 0.5 && closeEnough) || forceJump > 0;
         client.options.jumpKey.setPressed(wantJump && client.player.isOnGround());
         if (forceJump > 0) forceJump--;
+        // Strafe sideways while nudging: pressing only "forward" cannot slide a hitbox that is
+        // caught on a corner, which is why the player used to need a manual key press.
+        if (nudgeTicks > 0) {
+            nudgeTicks--;
+            boolean left = (nudgeTicks / 5) % 2 == 0;
+            client.options.leftKey.setPressed(left);
+            client.options.rightKey.setPressed(!left);
+        } else {
+            client.options.leftKey.setPressed(false);
+            client.options.rightKey.setPressed(false);
+        }
 
         double distance = Math.sqrt(dx * dx + dz * dz) + Math.abs(dy) * 1.5;
         if (!waypoint.equals(trackedWaypoint)) {
@@ -821,6 +874,14 @@ public final class AreaMinerClient implements ClientModInitializer {
             lastWaypointDistance = Double.POSITIVE_INFINITY;
             trackedWaypoint = null;
             forceJump = 12;
+            if (nudgeTicks <= 0 && !waypoint.equals(nudgeDone)) {
+                nudgeDone = waypoint;
+                nudgeTicks = 16;
+                LOGGER.info("[areaminer] stuck at {}, trying a strafe nudge (pos={}, route={}, forward={})",
+                        waypoint, client.player.getBlockPos(), route.size(),
+                        client.options.forwardKey.isPressed());
+                return;
+            }
             if (++stallRepaths > MAX_STALL_REPATHS) {
                 BlockPos stuck = target;
                 blacklist(client, target);
@@ -833,6 +894,72 @@ public final class AreaMinerClient implements ClientModInitializer {
             // Force a fresh path on the next tick.
             route.clear();
             routeAge = REPATH_INTERVAL_TICKS;
+        }
+    }
+
+    private static double directDistance(MinecraftClient client) {
+        return client.player.getEntityPos().squaredDistanceTo(Vec3d.ofCenter(directTarget));
+    }
+
+    /**
+     * Straight-line fallback for the cases A* cannot model (gaps, water, odd geometry): push
+     * toward the block the same way a player would, jumping while moving, and give up if there is
+     * no progress or the way ahead is lava.
+     */
+    private static void directWalk(MinecraftClient client) {
+        directTicks--;
+        double distSq = directDistance(client);
+        if (distSq < directLastDist - 0.05) {
+            directLastDist = distSq;
+            directStallTicks = 0;
+        } else if (++directStallTicks > 40) {
+            giveUpDirect(client);
+            return;
+        }
+        if (directTicks <= 0) {
+            giveUpDirect(client);
+            return;
+        }
+
+        Vec3d center = Vec3d.ofCenter(directTarget);
+        Vec3d feet = client.player.getEntityPos();
+        double dx = center.x - feet.x;
+        double dz = center.z - feet.z;
+        client.player.setYaw(MathHelper.wrapDegrees((float) (Math.toDegrees(Math.atan2(dz, dx)) - 90.0)));
+        client.player.setPitch(0.0f);
+        client.player.setSprinting(false);
+
+        if (!movementOwned) {
+            savedForward = client.options.forwardKey.isPressed();
+            savedJump = client.options.jumpKey.isPressed();
+            savedSneak = client.options.sneakKey.isPressed();
+            savedSprint = client.options.sprintKey.isPressed();
+            savedLeft = client.options.leftKey.isPressed();
+            savedRight = client.options.rightKey.isPressed();
+            movementOwned = true;
+        }
+
+        // Do not step into lava; everything else is fair game for the fallback.
+        int stepX = (int) Math.signum(dx);
+        int stepZ = (int) Math.signum(dz);
+        BlockPos ahead = client.player.getBlockPos().add(stepX, 0, stepZ);
+        if (client.world.getBlockState(ahead).getFluidState().isIn(net.minecraft.registry.tag.FluidTags.LAVA)) {
+            giveUpDirect(client);
+            return;
+        }
+
+        client.options.forwardKey.setPressed(true);
+        client.options.jumpKey.setPressed(client.player.isOnGround());
+    }
+
+    private static void giveUpDirect(MinecraftClient client) {
+        BlockPos stuck = directTarget;
+        directTicks = 0;
+        directTarget = null;
+        releaseMovement(client);
+        if (stuck != null) {
+            blacklist(client, stuck);
+            client.player.sendMessage(Text.literal("直接走过去也没成功：" + format(stuck)), true);
         }
     }
 
@@ -936,6 +1063,9 @@ public final class AreaMinerClient implements ClientModInitializer {
             client.options.jumpKey.setPressed(savedJump);
             client.options.sneakKey.setPressed(savedSneak);
             client.options.sprintKey.setPressed(savedSprint);
+            client.options.leftKey.setPressed(savedLeft);
+            client.options.rightKey.setPressed(savedRight);
+            nudgeTicks = 0;
             movementOwned = false;
         }
     }
