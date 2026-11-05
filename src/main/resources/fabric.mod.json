@@ -4,6 +4,8 @@
   "version": "${version}",
   "name": "Area Miner",
   "description": "Client-side, normal-interaction area mining helper with a visible selection outline.",
+  "authors": ["CNGM222"],
+  "license": "CC-BY-NC-4.0",
   "environment": "client",
   "entrypoints": {
     "client": [
