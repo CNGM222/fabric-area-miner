@@ -36,7 +36,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
@@ -65,13 +64,25 @@ public final class AreaMinerClient implements ClientModInitializer {
     private static final int MAX_PATH_NODES = 6_000;
     private static final long PATH_TIME_BUDGET_NS = 25_000_000L;
     private static final int REPATH_INTERVAL_TICKS = 40;
-    /** Give up on a single block after ten seconds of swinging at it. */
-    private static final int MAX_TARGET_TICKS = 200;
+    /** Give up on a single block after three seconds of swinging at it. */
+    private static final int MAX_TARGET_TICKS = 60;
     private static final int STALL_TICKS = 50;
     private static final int MAX_IDLE_TICKS = 100;
     private static final int MAX_PATH_FAILURES = 3;
     private static final int MAX_STALL_REPATHS = 3;
     private static final double LOW_OBSTACLE_HEIGHT = 0.6;
+    /**
+     * Blocks at or below this hardness break in a few ticks with a bare hand. Switching to a
+     * "better" tool for them is pointless (efficiency does not even apply when the tool's own
+     * speed multiplier is 1) and it costs durability, so those are mined without a tool.
+     */
+    private static final float INSTANT_BREAK_HARDNESS = 0.15f;
+    /** Only look this far around the player for the next target before falling back to a full scan. */
+    private static final int TARGET_SCAN_RADIUS = 12;
+    /** Upper bound on ray tests per target selection, so a hotbar full of thin blocks cannot stall a tick. */
+    private static final int MAX_HIT_TESTS = 24;
+    /** Entries of the work list re-validated per tick (the whole list is swept in the background). */
+    private static final int PRUNE_BATCH = 256;
 
     private static KeyBinding selectCornerKey;
     private static KeyBinding startStopKey;
@@ -90,11 +101,13 @@ public final class AreaMinerClient implements ClientModInitializer {
     private static BlockPos target;
     private static BlockPos breaking;
     private static int targetTicks;
+    private static int lastBreakProgress;
 
     private static final ArrayDeque<BlockPos> route = new ArrayDeque<>();
     private static int routeAge;
-    private static int pruneTimer;
-    private static int equipTimer;
+    private static int pruneCursor;
+    private static BlockPos equippedFor;
+    private static int equipRefresh;
 
     private static boolean movementOwned;
     private static boolean savedForward;
@@ -234,8 +247,9 @@ public final class AreaMinerClient implements ClientModInitializer {
         targetTicks = 0;
         route.clear();
         routeAge = 0;
-        pruneTimer = 0;
-        equipTimer = 0;
+        pruneCursor = 0;
+        equippedFor = null;
+        equipRefresh = 0;
         resetWaypointProgress();
         stallRepaths = 0;
         idleTicks = 0;
@@ -262,12 +276,9 @@ public final class AreaMinerClient implements ClientModInitializer {
             unreachable.clear();
             pathFailures.clear();
         }
-        if (--pruneTimer <= 0) {
-            pruneTimer = 20;
-            if (prune(client)) {
-                unreachable.clear();
-                pathFailures.clear();
-            }
+        if (prune(client)) {
+            unreachable.clear();
+            pathFailures.clear();
         }
         if (remaining.isEmpty()) {
             stop(client, "区域挖掘完成");
@@ -276,7 +287,7 @@ public final class AreaMinerClient implements ClientModInitializer {
 
         if (target == null) {
             target = chooseTarget(client);
-            equipTimer = 0;
+            equippedFor = null;
             if (target == null) {
                 stop(client, "选区内剩余的方块都无法到达，已停止");
                 return;
@@ -329,33 +340,55 @@ public final class AreaMinerClient implements ClientModInitializer {
         resetWaypointProgress();
 
         lookAt(client.player, hit.getPos());
-        if (equipTimer-- <= 0) {
-            equipBestTool(client, client.world.getBlockState(target));
-            equipTimer = 20;
+        // Re-evaluate the tool for every new block: a tool picked for the previous block must
+        // never carry over (that is what made the miner crawl through stone with the wrong tool).
+        if (!target.equals(equippedFor) || equipRefresh-- <= 0) {
+            equipFor(client, target);
+            equippedFor = target;
+            equipRefresh = 40;
         }
 
         Direction side = hit.getSide();
         if (!target.equals(breaking)) {
             cancelBreaking(client);
             targetTicks = 0;
+            lastBreakProgress = -1;
             if (client.interactionManager.attackBlock(target, side)) breaking = target;
         }
         if (target.equals(breaking)) {
             client.interactionManager.updateBlockBreakingProgress(target, side);
+            int progress = client.interactionManager.getBlockBreakingProgress();
+            if (progress > lastBreakProgress) {
+                lastBreakProgress = progress;
+                targetTicks = 0;
+            }
         }
         if (++targetTicks > MAX_TARGET_TICKS) {
-            // Something refuses to break (claim protection, wrong tool, ...). Skip it.
+            // No breaking progress for three seconds (claim protection, wrong tool, ...). Skip it.
             blacklist(client, target);
         }
     }
 
-    /** Picks the next block to work on: nearest visible one, else nearest exposed one. */
+    /**
+     * Picks the next block to work on, closest first: the nearest block that can either be hit
+     * from here or sits on an exposed surface. Distance is measured from the player's feet, so
+     * blocks above/below are not artificially penalised.
+     */
     private static BlockPos chooseTarget(MinecraftClient client) {
+        BlockPos nearby = scanForTarget(client, TARGET_SCAN_RADIUS);
+        if (nearby != null) return nearby;
+        // Nothing left close by: fall back to a full scan for the next area to walk to.
+        return scanForTarget(client, Integer.MAX_VALUE);
+    }
+
+    private static BlockPos scanForTarget(MinecraftClient client, int maxRadius) {
         World world = client.world;
         PlayerEntity player = client.player;
         Vec3d eye = player.getEyePos();
+        Vec3d origin = player.getEntityPos();
         double reach = reach(client);
         double reachSq = reach * reach;
+        double radiusSq = (double) maxRadius * maxRadius;
 
         BlockPos bestVisible = null;
         double bestVisibleSq = Double.MAX_VALUE;
@@ -363,36 +396,61 @@ public final class AreaMinerClient implements ClientModInitializer {
         double bestExposedSq = Double.MAX_VALUE;
         BlockPos bestAny = null;
         double bestAnySq = Double.MAX_VALUE;
+        int hitTests = 0;
+        // Mining the block you are standing on makes you fall; only pick it when nothing else is
+        // anywhere near.
+        BlockPos supportBlock = player.getBlockPos().down();
 
         for (BlockPos pos : remaining) {
             if (unreachable.contains(pos)) continue;
-            double distSq = eye.squaredDistanceTo(Vec3d.ofCenter(pos));
+            double dx = origin.x - (pos.getX() + 0.5);
+            double dy = origin.y - (pos.getY() + 0.5);
+            double dz = origin.z - (pos.getZ() + 0.5);
+            double distSq = dx * dx + dy * dy + dz * dz;
+            if (pos.equals(supportBlock)) distSq += 9.0;
+            if (distSq > radiusSq) continue;
             if (distSq < bestAnySq) {
                 bestAnySq = distSq;
                 bestAny = pos;
             }
-            if (distSq <= reachSq && distSq < bestVisibleSq
-                    && findHit(world, player, eye, pos, reach) != null) {
-                bestVisibleSq = distSq;
-                bestVisible = pos;
+            if (distSq <= reachSq && distSq < bestVisibleSq && hitTests < MAX_HIT_TESTS) {
+                hitTests++;
+                if (findHit(world, player, eye, pos, reach) != null) {
+                    bestVisibleSq = distSq;
+                    bestVisible = pos;
+                }
             }
             if (distSq < bestExposedSq && isExposed(world, pos)) {
                 bestExposedSq = distSq;
                 bestExposed = pos;
             }
         }
+        // Closest wins; being able to hit it right away only breaks the tie in its favour.
+        if (bestVisible != null && bestExposed != null) {
+            return bestVisibleSq <= bestExposedSq ? bestVisible : bestExposed;
+        }
         if (bestVisible != null) return bestVisible;
         if (bestExposed != null) return bestExposed;
         return bestAny;
     }
 
+    /**
+     * Time-sliced re-validation of the work list: a few hundred entries per tick instead of a
+     * multi-million-lookup stall whenever the list is large.
+     */
     private static boolean prune(MinecraftClient client) {
+        int size = remaining.size();
+        if (size == 0) return false;
         boolean changed = false;
-        Iterator<BlockPos> iterator = remaining.iterator();
-        while (iterator.hasNext()) {
-            BlockPos pos = iterator.next();
-            if (isMineable(client.world, pos)) continue;
-            iterator.remove();
+        int budget = Math.min(PRUNE_BATCH, size);
+        for (int i = 0; i < budget; i++) {
+            if (pruneCursor >= remaining.size()) pruneCursor = 0;
+            BlockPos pos = remaining.get(pruneCursor);
+            if (isMineable(client.world, pos)) {
+                pruneCursor++;
+                continue;
+            }
+            remaining.remove(pruneCursor);
             changed = true;
             if (pos.equals(target)) forgetTarget(client);
         }
@@ -404,6 +462,7 @@ public final class AreaMinerClient implements ClientModInitializer {
         target = null;
         targetTicks = 0;
         idleTicks = 0;
+        equippedFor = null;
         route.clear();
         routeAge = 0;
         resetWaypointProgress();
@@ -674,6 +733,42 @@ public final class AreaMinerClient implements ClientModInitializer {
     }
 
     // ------------------------------------------------------------------ tool selection
+
+    /** Chooses the hotbar slot to hold while breaking {@code pos}. */
+    private static void equipFor(MinecraftClient client, BlockPos pos) {
+        BlockState state = client.world.getBlockState(pos);
+        if (state.isAir()) return;
+        if (state.getHardness(client.world, pos) <= INSTANT_BREAK_HARDNESS) {
+            equipNonTool(client);
+        } else {
+            equipBestTool(client, state);
+        }
+    }
+
+    /**
+     * Prefers an empty hand (or any non-damageable item) for blocks that break in a few ticks
+     * anyway: it saves tool durability, and it guarantees the miner never carries a shears/hoe
+     * picked for a carpet into the next stone block.
+     */
+    private static void equipNonTool(MinecraftClient client) {
+        PlayerInventory inventory = client.player.getInventory();
+        if (!inventory.getStack(inventory.getSelectedSlot()).isDamageable()) return;
+        int empty = -1;
+        int safe = -1;
+        for (int slot = 0; slot < 9; slot++) {
+            ItemStack stack = inventory.getStack(slot);
+            if (stack.isEmpty()) {
+                if (empty < 0) empty = slot;
+            } else if (!stack.isDamageable() && safe < 0) {
+                safe = slot;
+            }
+        }
+        if (empty >= 0) {
+            inventory.setSelectedSlot(empty);
+        } else if (safe >= 0) {
+            inventory.setSelectedSlot(safe);
+        }
+    }
 
     /**
      * Picks the hotbar slot with the highest vanilla mining speed for {@code state}. This is the
