@@ -10,12 +10,10 @@ base {
 }
 
 loom {
-    splitEnvironmentSourceSets()
-
+    // Client-only mod: a single merged source set keeps the offline build simple.
     mods {
         "areaminer" {
             sourceSet sourceSets.main
-            sourceSet sourceSets.client
         }
     }
 }
